@@ -3,18 +3,20 @@
 import { useState, useEffect } from 'react';
 import {
   useAccount,
-  useReadContract,
+  useReadContracts,
   useWriteContract,
   useWaitForTransactionReceipt,
   useConnect,
   useDisconnect,
   useSwitchChain,
+  useSimulateContract,
 } from 'wagmi';
 import { base } from 'wagmi/chains';
-import { parseEther } from 'viem';
+import { formatEther } from 'viem';
 
 const CONTRACT_ADDRESS = '0xd49Ee0CB5193325ad10F94BAcA59aC6ffeaBcBbF' as `0x${string}`;
-const MINT_PRICE = '0.001';
+const DEFAULT_TOKEN_URI =
+  'ipfs://bafkreifnj5l342rc6d6ebccabz4h3v26fkbmpikcyj5lxdk4ynfwvsccta';
 const SHORT_ADDRESS = CONTRACT_ADDRESS.slice(0, 10) + '...' + CONTRACT_ADDRESS.slice(-8);
 const BASESCAN_URL = 'https://basescan.org/address/' + CONTRACT_ADDRESS;
 const OPENSEA_URL = 'https://opensea.io/assets/base/' + CONTRACT_ADDRESS;
@@ -44,52 +46,81 @@ const ABI = [
     inputs: [],
     outputs: [{ name: '', type: 'uint256' }],
   },
+  {
+    name: 'MINT_PRICE',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    name: 'MAX_SUPPLY',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
 ] as const;
 
 function ConnectWallet() {
-  const { connect, connectors } = useConnect();
+  const { connect, connectors, error, isPending } = useConnect();
   const { disconnect } = useDisconnect();
   const { isConnected, address } = useAccount();
   const [mounted, setMounted] = useState(false);
   const [showList, setShowList] = useState(false);
 
-  useEffect(() => setMounted(true), []);
+  useEffect(() => {
+    queueMicrotask(() => setMounted(true));
+  }, []);
 
-  if (!mounted) return (
-    <button className="bg-white text-black px-6 py-2 rounded-full text-sm font-medium">
-      Connect Wallet
-    </button>
-  );
+  if (!mounted) {
+    return (
+      <button className="bg-white text-black px-6 py-2 rounded-full text-sm font-medium">
+        Connect Wallet
+      </button>
+    );
+  }
 
-  if (isConnected) return (
-    <button
-      onClick={() => disconnect()}
-      className="bg-white/10 border border-white/20 px-6 py-2 rounded-full text-sm font-medium hover:bg-white/20 transition"
-    >
-      {address?.slice(0, 6)}...{address?.slice(-4)} X
-    </button>
-  );
+  if (isConnected) {
+    return (
+      <button
+        onClick={() => disconnect()}
+        className="bg-white/10 border border-white/20 px-6 py-2 rounded-full text-sm font-medium hover:bg-white/20 transition"
+      >
+        {address?.slice(0, 6)}...{address?.slice(-4)} X
+      </button>
+    );
+  }
 
   return (
     <div className="relative">
       <button
         onClick={() => setShowList(!showList)}
-        className="bg-white text-black px-6 py-2 rounded-full text-sm font-medium hover:bg-gray-100 transition"
+        disabled={isPending || connectors.length === 0}
+        className="bg-white text-black px-6 py-2 rounded-full text-sm font-medium hover:bg-gray-100 transition disabled:opacity-50"
       >
-        Connect Wallet
+        {isPending ? 'Connecting...' : 'Connect Wallet'}
       </button>
       {showList && (
         <div className="absolute right-0 mt-2 bg-gray-900 border border-white/10 rounded-2xl overflow-hidden shadow-2xl z-10 min-w-48">
           {connectors.map((connector) => (
             <button
-              key={connector.id}
-              onClick={() => { connect({ connector }); setShowList(false); }}
+              key={connector.uid}
+              onClick={() => {
+                connect({ connector, chainId: base.id });
+                setShowList(false);
+              }}
               className="w-full text-left px-4 py-3 hover:bg-white/10 text-sm transition"
             >
               {connector.name}
             </button>
           ))}
         </div>
+      )}
+      {error && (
+        <p className="absolute right-0 mt-2 text-xs text-red-400 whitespace-nowrap">
+          {error.message.split('\n')[0]}
+        </p>
       )}
     </div>
   );
@@ -101,40 +132,93 @@ export default function Home() {
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
-    setMounted(true);
+    queueMicrotask(() => setMounted(true));
   }, []);
 
-  const { writeContract, data: hash, isPending } = useWriteContract();
+  const { data: contractReads } = useReadContracts({
+    contracts: [
+      {
+        address: CONTRACT_ADDRESS,
+        abi: ABI,
+        functionName: 'totalMinted',
+        chainId: base.id,
+      },
+      {
+        address: CONTRACT_ADDRESS,
+        abi: ABI,
+        functionName: 'remainingSupply',
+        chainId: base.id,
+      },
+      {
+        address: CONTRACT_ADDRESS,
+        abi: ABI,
+        functionName: 'MINT_PRICE',
+        chainId: base.id,
+      },
+      {
+        address: CONTRACT_ADDRESS,
+        abi: ABI,
+        functionName: 'MAX_SUPPLY',
+        chainId: base.id,
+      },
+    ],
+    query: {
+      enabled: mounted,
+    },
+  });
+
+  const totalMinted = contractReads?.[0]?.result;
+  const remaining = contractReads?.[1]?.result;
+  const mintPriceWei = contractReads?.[2]?.result;
+  const maxSupply = contractReads?.[3]?.result;
+
+  const mintArgs = address ? ([address, DEFAULT_TOKEN_URI] as const) : undefined;
+  const canMint =
+    mounted &&
+    isConnected &&
+    Boolean(address) &&
+    chain?.id === base.id &&
+    remaining !== undefined &&
+    remaining > BigInt(0) &&
+    mintPriceWei !== undefined;
+
+  const { error: simulateError } = useSimulateContract({
+    address: CONTRACT_ADDRESS,
+    abi: ABI,
+    functionName: 'mint',
+    args: mintArgs,
+    value: mintPriceWei,
+    chainId: base.id,
+    query: {
+      enabled: canMint,
+    },
+  });
+
+  const { writeContract, data: hash, isPending, error: writeError, reset } = useWriteContract();
   const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({ hash });
 
-  const { data: totalMinted } = useReadContract({
-    address: CONTRACT_ADDRESS,
-    abi: ABI,
-    functionName: 'totalMinted',
-  });
-
-  const { data: remaining } = useReadContract({
-    address: CONTRACT_ADDRESS,
-    abi: ABI,
-    functionName: 'remainingSupply',
-  });
-
-  // Hydration guard clause to keep Next.js stable
   if (!mounted) return <div className="min-h-screen bg-black" />;
 
   const isWrongNetwork = isConnected && chain?.id !== base.id;
-  const minted = totalMinted ? Number(totalMinted) : 0;
-  const left = remaining ? Number(remaining) : 100;
-  const progressPercent = (minted / 100) * 100;
+  const minted = totalMinted !== undefined ? Number(totalMinted) : 0;
+  const left = remaining !== undefined ? Number(remaining) : null;
+  const supplyCap = maxSupply !== undefined ? Number(maxSupply) : 100;
+  const progressPercent = supplyCap > 0 ? (minted / supplyCap) * 100 : 0;
+  const mintPriceDisplay =
+    mintPriceWei !== undefined ? formatEther(mintPriceWei) : null;
+  const mintBlockedReason = simulateError?.message.split('\n')[0];
 
   const handleMint = () => {
-    if (!address) return;
+    if (!address || !mintPriceWei || mintBlockedReason) return;
+
+    reset();
     writeContract({
       address: CONTRACT_ADDRESS,
       abi: ABI,
       functionName: 'mint',
-      args: [address, 'ipfs://bafkreifnj5l342rc6d6ebccabz4h3v26fkbmpikcyj5lxdk4ynfwvsccta'], 
-      value: parseEther(MINT_PRICE),
+      args: [address, DEFAULT_TOKEN_URI],
+      value: mintPriceWei,
+      chainId: base.id,
     });
   };
 
@@ -149,7 +233,6 @@ export default function Home() {
       </nav>
 
       <div className="max-w-2xl mx-auto px-6 py-16 text-center">
-
         <div className="inline-flex items-center gap-2 bg-white/5 border border-white/10 rounded-full px-4 py-1.5 text-xs text-gray-400 mb-8">
           <span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>
           Live on Base Mainnet
@@ -168,11 +251,11 @@ export default function Home() {
             <p className="text-gray-500 text-xs mt-1">Minted</p>
           </div>
           <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
-            <p className="text-2xl font-bold">{left}</p>
+            <p className="text-2xl font-bold">{left ?? '—'}</p>
             <p className="text-gray-500 text-xs mt-1">Remaining</p>
           </div>
           <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
-            <p className="text-2xl font-bold">{MINT_PRICE}</p>
+            <p className="text-2xl font-bold">{mintPriceDisplay ?? '—'}</p>
             <p className="text-gray-500 text-xs mt-1">ETH per mint</p>
           </div>
         </div>
@@ -200,14 +283,38 @@ export default function Home() {
         ) : (
           <button
             onClick={handleMint}
-            disabled={isPending || isConfirming || isWrongNetwork || left === 0}
+            disabled={
+              isPending ||
+              isConfirming ||
+              isWrongNetwork ||
+              left === 0 ||
+              mintPriceWei === undefined ||
+              Boolean(mintBlockedReason)
+            }
             className="w-full bg-white text-black py-4 rounded-2xl font-semibold text-lg hover:bg-gray-100 disabled:bg-white/20 disabled:text-white/40 transition"
           >
-            {isPending ? 'Confirm in wallet...' :
-             isConfirming ? 'Minting...' :
-             left === 0 ? 'Sold Out' :
-             'Mint for ' + MINT_PRICE + ' ETH'}
+            {isPending
+              ? 'Confirm in wallet...'
+              : isConfirming
+                ? 'Minting...'
+                : left === 0
+                  ? 'Sold Out'
+                  : mintPriceDisplay
+                    ? 'Mint for ' + mintPriceDisplay + ' ETH'
+                    : 'Loading mint price...'}
           </button>
+        )}
+
+        {mintBlockedReason && isConnected && !isWrongNetwork && left !== 0 && (
+          <div className="mt-4 bg-red-500/10 border border-red-500/20 rounded-2xl p-4">
+            <p className="text-red-400 text-sm">{mintBlockedReason}</p>
+          </div>
+        )}
+
+        {writeError && (
+          <div className="mt-4 bg-red-500/10 border border-red-500/20 rounded-2xl p-4">
+            <p className="text-red-400 text-sm">{writeError.message.split('\n')[0]}</p>
+          </div>
         )}
 
         {isSuccess && (
